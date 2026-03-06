@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data (large files — store elsewhere or use DVC)
+data/data_wound_seg_3class/train_images/
+data/data_wound_seg_3class/train_masks/
+data/data_wound_seg_3class/test_images/
+data/data_wound_seg_3class/test_masks/
+
+# Model weights
+checkpoints/
+*.pt
+*.pth
+*.bin
+
+# Outputs
+outputs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
