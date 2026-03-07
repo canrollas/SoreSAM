@@ -125,12 +125,17 @@ class SAM2WoundSegmenter(nn.Module):
         #   {"vision_features": ..., "vision_pos_enc": [...], "backbone_fpn": [...]}
         backbone_out = self.image_encoder(images)
 
-        # The FPN neck is attached to the mask decoder in SAM2
-        fpn_features: List[torch.Tensor] = self.mask_decoder.neck(backbone_out)
-        # fpn_features is a list ordered coarse → fine (or fine → coarse).
-        # SAM2 convention: index -1 is the coarsest (64×64 for 1024 input),
-        # indices [:-1] are high-res feature maps.
+        # image_encoder already applies the FPN neck internally.
+        # Output dict keys: "backbone_fpn", "vision_features", "vision_pos_enc"
+        fpn_features: List[torch.Tensor] = list(backbone_out["backbone_fpn"])
 
+        # SAM2 projects the two finest FPN levels via conv_s0/conv_s1 in the
+        # mask decoder before passing them as high-res features.
+        if hasattr(self.mask_decoder, "conv_s0"):
+            fpn_features[0] = self.mask_decoder.conv_s0(fpn_features[0])
+            fpn_features[1] = self.mask_decoder.conv_s1(fpn_features[1])
+
+        # SAM2 convention: last entry is the coarsest (64×64 for 1024 input).
         image_embed = fpn_features[-1]          # (B, 256, 64, 64)
         high_res_feats = fpn_features[:-1]      # [(B,32,256,256),(B,64,128,128)]
 
