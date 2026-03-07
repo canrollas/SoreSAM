@@ -52,7 +52,7 @@ class ModelConfig:
     sam2_checkpoint: str = "checkpoints/sam2.1_hiera_large.pt"
 
     # Number of learnable prompt tokens per class
-    num_class_tokens: int = 4
+    num_class_tokens: int = 8     # was 4 — more tokens = richer class representations
 
     # Freeze SAM2 image encoder during training
     freeze_image_encoder: bool = True
@@ -73,21 +73,21 @@ class TrainConfig:
     num_workers: int = 2
 
     # Optimiser
-    lr: float = 1e-4
+    lr: float = 2e-5              # was 1e-4 — too high, caused oscillation after epoch 2
     weight_decay: float = 1e-4
     # Separate (lower) LR for mask decoder vs class tokens
-    decoder_lr_multiplier: float = 0.1
+    decoder_lr_multiplier: float = 1.0  # was 0.1 — equal LR is more stable at lower base LR
 
     # LR scheduler
     lr_scheduler: str = "cosine"   # "cosine" | "step" | "none"
-    warmup_epochs: int = 2
+    warmup_epochs: int = 5         # was 2 — longer warmup for stable token convergence
 
     # Loss weights
     ce_weight: float = 1.0
     dice_weight: float = 1.0
 
     # Class weights for CE loss (up-weight wound & skin)
-    class_weights: List[float] = field(default_factory=lambda: [0.5, 1.0, 2.0])
+    class_weights: List[float] = field(default_factory=lambda: [0.5, 1.0, 1.5])  # was [0.5,1.0,2.0] — 2.0 caused wound over-prediction
 
     # Logging / saving
     log_interval: int = 10      # batches
