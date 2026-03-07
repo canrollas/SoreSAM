@@ -23,7 +23,8 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+import warnings
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -80,7 +81,7 @@ def build_dataloaders(config: Config):
 
     train_ds = WoundDataset(
         config.data.root, split="train",
-        val_indices=train_idx,
+        val_indices=val_idx,
         color_threshold=config.data.color_threshold,
         image_size=config.data.image_size,
     )
@@ -163,7 +164,7 @@ def train_one_epoch(
 
         optimiser.zero_grad()
 
-        with autocast(enabled=config.train.use_amp):
+        with autocast("cuda", enabled=config.train.use_amp):
             logits = model(images)
             loss, loss_dict = criterion(logits, labels)
 
@@ -215,7 +216,7 @@ def validate(
         images = batch["image"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        with autocast(enabled=config.train.use_amp):
+        with autocast("cuda", enabled=config.train.use_amp):
             logits = model(images)
             loss, _ = criterion(logits, labels)
 
@@ -324,7 +325,14 @@ def main() -> None:
 
     # Scheduler + AMP
     scheduler = build_scheduler(optimiser, config, steps_per_epoch=len(train_loader))
-    scaler = GradScaler(enabled=config.train.use_amp)
+    scaler = GradScaler("cuda", enabled=config.train.use_amp)
+    # SequentialLR calls step() internally during init which triggers a false-positive
+    # "step before optimizer.step()" warning — suppress it.
+    warnings.filterwarnings(
+        "ignore",
+        message="Detected call of `lr_scheduler.step\\(\\)` before `optimizer.step\\(\\)`",
+        category=UserWarning,
+    )
 
     # Metrics
     metrics = SegmentationMetrics(

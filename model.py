@@ -67,6 +67,7 @@ class SAM2WoundSegmenter(nn.Module):
         freeze_image_encoder: bool = True,
         freeze_prompt_encoder: bool = True,
         image_size: int = 1024,
+        device: str = "cpu",
     ):
         super().__init__()
 
@@ -77,7 +78,7 @@ class SAM2WoundSegmenter(nn.Module):
         # ------------------------------------------------------------------
         # Load SAM2 and extract sub-modules
         # ------------------------------------------------------------------
-        sam2: SAM2Base = build_sam2(sam2_config, sam2_checkpoint)
+        sam2: SAM2Base = build_sam2(sam2_config, sam2_checkpoint, device=device)
 
         self.image_encoder = sam2.image_encoder
         self.prompt_encoder = sam2.sam_prompt_encoder
@@ -274,6 +275,7 @@ def build_model(
         num_class_tokens=num_class_tokens,
         freeze_image_encoder=freeze_image_encoder,
         freeze_prompt_encoder=freeze_prompt_encoder,
+        device=device,
     )
     model = model.to(device)
     print(model)

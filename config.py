@@ -70,7 +70,7 @@ class TrainConfig:
 
     num_epochs: int = 50
     batch_size: int = 4
-    num_workers: int = 4
+    num_workers: int = 2
 
     # Optimiser
     lr: float = 1e-4
