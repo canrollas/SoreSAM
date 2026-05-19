@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter
 
 from config import cfg
 from dataset import mask_rgb_to_label
@@ -92,6 +93,7 @@ def run_inference(
     device: torch.device,
     prev_probs: np.ndarray | None = None,
     prior_weight: float = 0.0,
+    smooth_sigma: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Run the model and return a predicted label map plus softmax probabilities.
@@ -102,8 +104,10 @@ def run_inference(
 
     Parameters
     ----------
-    prev_probs   : (num_classes, H, W) float32 from the previous frame, or None
-    prior_weight : weight given to prev_probs (0 = disabled, 0.3 = recommended)
+    prev_probs    : (num_classes, H, W) float32 from the previous frame, or None
+    prior_weight  : weight given to prev_probs (0 = disabled, 0.3 = recommended)
+    smooth_sigma  : Gaussian sigma applied per-class to logits before softmax,
+                    smooths blocky patch-boundary artifacts (0 = disabled, 1-3 recommended)
 
     Returns
     -------
@@ -113,8 +117,16 @@ def run_inference(
     """
     model.eval()
     image_tensor = image_tensor.to(device)
-    logits = model(image_tensor)                              # (1, C, H, W)
-    probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()  # (C, H, W)
+    logits = model(image_tensor)                                   # (1, C, H, W)
+    logits_np = logits.squeeze(0).cpu().numpy()                    # (C, H, W)
+
+    if smooth_sigma > 0.0:
+        for c in range(logits_np.shape[0]):
+            logits_np[c] = gaussian_filter(logits_np[c], sigma=smooth_sigma)
+
+    # softmax manually so we stay in numpy after the optional smoothing
+    e = np.exp(logits_np - logits_np.max(axis=0, keepdims=True))
+    probs = e / e.sum(axis=0, keepdims=True)                       # (C, H, W)
 
     if prev_probs is not None and prior_weight > 0.0:
         blended = (1.0 - prior_weight) * probs + prior_weight * prev_probs
@@ -140,9 +152,11 @@ def morphological_postprocess(
       2. Opening  (erosion → dilation) : removes small isolated noise blobs
       3. Remove connected components smaller than min_area pixels
 
-    The per-class binary masks are then merged back via argmax on a soft
-    vote array so that overlapping corrections resolve to the most
-    confidently corrected class.
+    Post-merge step:
+      4. Absorb isolated islands — any connected component completely enclosed
+         within a single foreign class gets reassigned to that class. Handles
+         scattered specks (e.g. Skin predictions inside a Wound region) that
+         closing alone cannot reach because they are too spread out.
 
     Parameters
     ----------
@@ -156,36 +170,53 @@ def morphological_postprocess(
     k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_ksize, close_ksize))
     k_open  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_ksize,  open_ksize))
 
-    # Accumulate corrected binary masks into a score volume
     score = np.zeros((num_classes, H, W), dtype=np.float32)
 
     for c in range(num_classes):
         mask = (pred == c).astype(np.uint8)
-
-        # 1. Closing: fill holes
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k_open)
 
-        # 2. Opening: remove small noise
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
-
-        # 3. Remove small connected components
         if min_area > 0 and mask.any():
             n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
             clean = np.zeros_like(mask)
-            for lbl in range(1, n_labels):          # skip background label 0
+            for lbl in range(1, n_labels):
                 if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
                     clean[labels == lbl] = 1
             mask = clean
 
         score[c] = mask.astype(np.float32)
 
-    # Pixels not claimed by any class after morphology fall back to Other (0)
-    # Resolve conflicts via argmax (class 0 wins ties because it is the default)
     result = score.argmax(axis=0).astype(np.uint8)
-
-    # Pixels where NO class claimed them → assign to the original prediction
     unclaimed = score.max(axis=0) == 0
     result[unclaimed] = pred[unclaimed]
+
+    # ── Step 4: absorb isolated islands ──────────────────────────────────────
+    # For each connected component in the merged result, check whether all its
+    # border-adjacent pixels belong to a single different class. If so, the
+    # component is an "island" and gets absorbed into that surrounding class.
+    k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        result.astype(np.uint8), connectivity=8
+    )
+    for lbl in range(1, n_labels):
+        component_mask = (labels == lbl).astype(np.uint8)
+        component_class = result[labels == lbl][0]
+
+        # Dilate the component by 1 pixel to find its border neighbours
+        border = cv2.dilate(component_mask, k_dilate) - component_mask
+        neighbour_classes = result[border == 1]
+        if neighbour_classes.size == 0:
+            continue
+
+        unique, counts = np.unique(neighbour_classes, return_counts=True)
+        dominant = unique[counts.argmax()]
+
+        # Absorb only if the component is surrounded by a single foreign class
+        # and is smaller than 4× min_area (large regions are kept as-is)
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if dominant != component_class and area < 4 * min_area:
+            result[labels == lbl] = dominant
 
     return result
 
@@ -215,48 +246,51 @@ def plot_result(
     Without morphology  → 3 panels: Original | Overlay | Mask
     With morphology     → 4 panels: Original | Raw Overlay | Morph Overlay | Morph Mask
     """
-    # Resize & pad original image to match model output resolution
+    # Resize original image to match model output resolution, then crop padding
     h_orig, w_orig = original_rgb.shape[:2]
     scale  = image_size / max(h_orig, w_orig)
     new_h  = int(round(h_orig * scale))
     new_w  = int(round(w_orig * scale))
-    img_resized = cv2.resize(original_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    img_padded  = np.pad(img_resized, ((0, image_size - new_h), (0, image_size - new_w), (0, 0)))
+    img_display = cv2.resize(original_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-    use_morph = pred_morph is not None
+    # Crop predictions to the valid (non-padded) region
+    raw_display   = pred_raw[:new_h, :new_w]
+    morph_display = pred_morph[:new_h, :new_w] if pred_morph is not None else None
+
+    use_morph = morph_display is not None
     n_panels  = 4 if use_morph else 3
 
     fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 6), dpi=120)
     fig.suptitle("SoreSAM — Inference Result", fontsize=15, fontweight="bold", y=1.02)
 
     # Panel 0 — original
-    axes[0].imshow(img_padded)
+    axes[0].imshow(img_display)
     axes[0].set_title("Input Image", fontsize=12)
 
     if use_morph:
         # Panel 1 — raw prediction overlay
-        axes[1].imshow(overlay_mask(img_padded, pred_raw, alpha=alpha))
+        axes[1].imshow(overlay_mask(img_display, raw_display, alpha=alpha))
         axes[1].set_title("Raw Prediction", fontsize=12)
 
         # Panel 2 — morphological prediction overlay
-        axes[2].imshow(overlay_mask(img_padded, pred_morph, alpha=alpha))
+        axes[2].imshow(overlay_mask(img_display, morph_display, alpha=alpha))
         axes[2].set_title("After Morphology", fontsize=12)
 
         # Panel 3 — morphological mask only
-        axes[3].imshow(label_to_color(pred_morph))
+        axes[3].imshow(label_to_color(morph_display))
         axes[3].set_title("Morph Mask", fontsize=12)
 
-        coverage = compute_class_coverage(pred_morph, class_names)
+        coverage = compute_class_coverage(morph_display, class_names)
     else:
         # Panel 1 — raw overlay
-        axes[1].imshow(overlay_mask(img_padded, pred_raw, alpha=alpha))
+        axes[1].imshow(overlay_mask(img_display, raw_display, alpha=alpha))
         axes[1].set_title("Prediction Overlay", fontsize=12)
 
         # Panel 2 — raw mask only
-        axes[2].imshow(label_to_color(pred_raw))
+        axes[2].imshow(label_to_color(raw_display))
         axes[2].set_title("Prediction Mask", fontsize=12)
 
-        coverage = compute_class_coverage(pred_raw, class_names)
+        coverage = compute_class_coverage(raw_display, class_names)
 
     for ax in axes:
         ax.axis("off")
@@ -323,12 +357,14 @@ class Gallery:
         alpha: float,
         output_dir: str,
         prior_weight: float = 0.3,
+        smooth_sigma: float = 0.0,
     ):
         self.paths        = image_paths
         self.config       = config
         self.morph_kwargs = morph_kwargs
         self.alpha        = alpha
         self.output_dir   = Path(output_dir)
+        self.smooth_sigma = smooth_sigma
         self.idx          = 0
 
         # ── Batch inference ───────────────────────────────────────────
@@ -350,6 +386,7 @@ class Gallery:
                 model, tensor, device,
                 prev_probs=prev_probs,
                 prior_weight=prior_weight,
+                smooth_sigma=self.smooth_sigma,
             )
 
             pred_morph = None
@@ -363,13 +400,8 @@ class Gallery:
             h, w = original_rgb.shape[:2]
             scale = config.data.image_size / max(h, w)
             new_h, new_w = int(round(h * scale)), int(round(w * scale))
-            resized = cv2.resize(original_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            img_padded = np.pad(
-                resized,
-                ((0, config.data.image_size - new_h),
-                 (0, config.data.image_size - new_w), (0, 0)),
-            )
-            self.results.append((pred_raw, pred_morph, img_padded))
+            img_display = cv2.resize(original_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            self.results.append((pred_raw, pred_morph, img_display, new_h, new_w))
 
         print(f"\n[Gallery] Done. Opening viewer…\n")
 
@@ -385,28 +417,30 @@ class Gallery:
 
     # ------------------------------------------------------------------
     def _render(self) -> None:
-        pred_raw, pred_morph, img_padded = self.results[self.idx]
-        final  = pred_morph if pred_morph is not None else pred_raw
+        pred_raw, pred_morph, img_display, new_h, new_w = self.results[self.idx]
+        raw_display   = pred_raw[:new_h, :new_w]
+        morph_display = pred_morph[:new_h, :new_w] if pred_morph is not None else None
+        final  = morph_display if morph_display is not None else raw_display
         cnames = self.config.data.class_names
 
         for ax in self.axes:
             ax.cla()
             ax.axis("off")
 
-        self.axes[0].imshow(img_padded)
+        self.axes[0].imshow(img_display)
         self.axes[0].set_title("Input Image", fontsize=11)
 
-        if pred_morph is not None:
-            self.axes[1].imshow(overlay_mask(img_padded, pred_raw,   alpha=self.alpha))
+        if morph_display is not None:
+            self.axes[1].imshow(overlay_mask(img_display, raw_display,   alpha=self.alpha))
             self.axes[1].set_title("Raw Prediction", fontsize=11)
-            self.axes[2].imshow(overlay_mask(img_padded, pred_morph, alpha=self.alpha))
+            self.axes[2].imshow(overlay_mask(img_display, morph_display, alpha=self.alpha))
             self.axes[2].set_title("After Morphology", fontsize=11)
-            self.axes[3].imshow(label_to_color(pred_morph))
+            self.axes[3].imshow(label_to_color(morph_display))
             self.axes[3].set_title("Morph Mask", fontsize=11)
         else:
-            self.axes[1].imshow(overlay_mask(img_padded, pred_raw, alpha=self.alpha))
+            self.axes[1].imshow(overlay_mask(img_display, raw_display, alpha=self.alpha))
             self.axes[1].set_title("Prediction Overlay", fontsize=11)
-            self.axes[2].imshow(label_to_color(pred_raw))
+            self.axes[2].imshow(label_to_color(raw_display))
             self.axes[2].set_title("Prediction Mask", fontsize=11)
 
         # Coverage legend
@@ -473,6 +507,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha",           type=float, default=0.45, help="Overlay opacity (0-1)")
     p.add_argument("--device",          type=str,   default=None, help="cuda | cpu")
     p.add_argument("--no-show",         action="store_true",      help="Skip plt.show() (single-image mode)")
+    # Smoothing (reduces blocky patch-boundary artifacts on OOD images)
+    p.add_argument("--smooth-sigma",    type=float, default=0.0,
+                   help="Gaussian sigma on logits before softmax (0=off, try 1-3 for clinical images)")
     # Morphological post-processing
     p.add_argument("--no-morph",        action="store_true",      help="Disable morphological post-processing")
     p.add_argument("--close-ksize",     type=int, default=15,     help="Closing kernel size (fills holes)")
@@ -536,13 +573,14 @@ def main() -> None:
             alpha=args.alpha,
             output_dir=args.output_dir,
             prior_weight=args.prior_weight,
+            smooth_sigma=args.smooth_sigma,
         )
         return
 
     # ── Single image mode ─────────────────────────────────────────────────
     print(f"[Image] {args.image}")
     image_tensor, original_rgb = preprocess(args.image, config.data.image_size)
-    pred_raw, _ = run_inference(model, image_tensor, device)
+    pred_raw, _ = run_inference(model, image_tensor, device, smooth_sigma=args.smooth_sigma)
 
     pred_morph = None
     if morph_kwargs:
